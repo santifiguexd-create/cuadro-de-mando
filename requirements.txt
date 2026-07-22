@@ -1,0 +1,6 @@
+streamlit>=1.36
+pandas>=2.0
+sqlalchemy>=2.0
+requests>=2.31
+# Postgres/Supabase compartido (opcional):
+# psycopg[binary]>=3.1
