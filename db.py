@@ -1,12 +1,12 @@
 """
 Capa de datos del fondo. Fuente de verdad compartida.
 
-Por defecto usa SQLite (un archivo local). Para uso compartido entre vos y tu
-socio, apuntá a un Postgres/Supabase con la variable de entorno DATABASE_URL:
+Por defecto usa SQLite (un archivo local). Para uso compartido, apuntá a un
+Postgres/Supabase con la variable de entorno DATABASE_URL.
 
-    export DATABASE_URL="postgresql+psycopg://user:pass@host:5432/mesa"
-
-El resto del sistema (dashboard y recorder de snapshots) no cambia.
+Soporta dos tipos de posición:
+  - spot     : contado. Aporta al fondo su valor de mercado.
+  - futures  : perpetuo con margen aislado. Aporta al fondo margen + PnL.
 """
 import os
 import json
@@ -14,11 +14,11 @@ import datetime as dt
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String, Float,
-    DateTime, Text, select, insert, update, delete, func,
+    DateTime, Text, select, insert, update, delete, func, inspect, text,
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///mesa_fund.db")
-engine = create_engine(DATABASE_URL, future=True)
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 metadata = MetaData()
 
 positions = Table(
@@ -26,10 +26,14 @@ positions = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("symbol", String(32), nullable=False),
     Column("exchange", String(32), default="Binance"),
-    Column("side", String(8), default="Long"),        # Long | Short
+    Column("side", String(8), default="Long"),
     Column("qty", Float, nullable=False),
-    Column("entry", Float, nullable=False),            # precio de entrada (USDT)
-    Column("buy_date", String(16)),                    # YYYY-MM-DD
+    Column("entry", Float, nullable=False),
+    Column("buy_date", String(16)),
+    Column("market_type", String(16), default="spot"),
+    Column("leverage", Float, default=1.0),
+    Column("added_margin", Float, default=0.0),
+    Column("liq_price", Float),
     Column("created_at", DateTime, default=dt.datetime.utcnow),
 )
 
@@ -43,41 +47,65 @@ snapshots = Table(
     "snapshots", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("ts", DateTime, default=dt.datetime.utcnow),
-    Column("capital", Float),    # capital total del fondo (desplegado + reserva)
-    Column("deployed", Float),   # valor de mercado de las posiciones
-    Column("reserve", Float),    # cash sin invertir
-    Column("pnl", Float),        # P&L no realizado
-    Column("detail", Text),      # JSON con el desglose por posición
+    Column("capital", Float),
+    Column("deployed", Float),
+    Column("reserve", Float),
+    Column("pnl", Float),
+    Column("detail", Text),
 )
+
+_NEW_COLUMNS = {
+    "market_type": "VARCHAR(16) DEFAULT 'spot'",
+    "leverage": "FLOAT DEFAULT 1",
+    "added_margin": "FLOAT DEFAULT 0",
+    "liq_price": "FLOAT",
+}
 
 
 def init_db():
     metadata.create_all(engine)
+    _migrate()
 
 
-# ---------- posiciones ----------
+def _migrate():
+    """Agrega columnas nuevas sin borrar datos existentes (spot ya cargado)."""
+    insp = inspect(engine)
+    existing = {c["name"] for c in insp.get_columns("positions")}
+    with engine.begin() as c:
+        for col, ddl in _NEW_COLUMNS.items():
+            if col not in existing:
+                c.execute(text(f"ALTER TABLE positions ADD COLUMN {col} {ddl}"))
+
+
 def get_positions():
     with engine.begin() as c:
         rows = c.execute(select(positions).order_by(positions.c.created_at)).fetchall()
     return [dict(r._mapping) for r in rows]
 
 
+def _clean(p):
+    return dict(
+        symbol=p["symbol"].strip().upper(),
+        exchange=p.get("exchange", "Binance"),
+        side=p.get("side", "Long"),
+        qty=float(p["qty"]),
+        entry=float(p["entry"]),
+        buy_date=p.get("buy_date"),
+        market_type=p.get("market_type", "spot"),
+        leverage=float(p.get("leverage") or 1.0),
+        added_margin=float(p.get("added_margin") or 0.0),
+        liq_price=(float(p["liq_price"]) if p.get("liq_price") not in (None, "", 0) else None),
+    )
+
+
 def add_position(p):
     with engine.begin() as c:
-        c.execute(insert(positions).values(
-            symbol=p["symbol"].strip().upper(), exchange=p.get("exchange", "Binance"),
-            side=p.get("side", "Long"), qty=float(p["qty"]), entry=float(p["entry"]),
-            buy_date=p.get("buy_date"),
-        ))
+        c.execute(insert(positions).values(**_clean(p)))
 
 
 def update_position(pid, p):
     with engine.begin() as c:
-        c.execute(update(positions).where(positions.c.id == pid).values(
-            symbol=p["symbol"].strip().upper(), exchange=p.get("exchange", "Binance"),
-            side=p.get("side", "Long"), qty=float(p["qty"]), entry=float(p["entry"]),
-            buy_date=p.get("buy_date"),
-        ))
+        c.execute(update(positions).where(positions.c.id == pid).values(**_clean(p)))
 
 
 def delete_position(pid):
@@ -85,7 +113,6 @@ def delete_position(pid):
         c.execute(delete(positions).where(positions.c.id == pid))
 
 
-# ---------- reserva (cash) ----------
 def get_cash():
     with engine.begin() as c:
         r = c.execute(select(meta.c.value).where(meta.c.key == "cash")).fetchone()
@@ -101,7 +128,6 @@ def set_cash(amount):
             c.execute(insert(meta).values(key="cash", value=str(amount)))
 
 
-# ---------- snapshots ----------
 def add_snapshot(pf, ts=None):
     with engine.begin() as c:
         c.execute(insert(snapshots).values(
