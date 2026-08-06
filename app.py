@@ -80,9 +80,9 @@ with left:
                 unsafe_allow_html=True)
 with right:
     c1, c2 = st.columns(2)
-    c1.metric("Desplegado", money(pf["deployed"]),
+    c1.metric("Invertido", money(pf["deployed"]),
               f'{(pf["deployed"]/pf["capital"]*100 if pf["capital"] else 0):.1f}% del fondo')
-    c2.metric("Reserva", money(pf["reserve"]),
+    c2.metric("Líquido", money(pf["reserve"]),
               f'{(pf["reserve"]/pf["capital"]*100 if pf["capital"] else 0):.1f}% del fondo')
 
 st.divider()
@@ -114,7 +114,7 @@ with tab_res:
 
         st.markdown("###### Evolución del capital del fondo")
         chart = sdf.set_index("ts")[["capital", "deployed", "reserve"]]
-        chart.columns = ["Capital total", "Desplegado", "Reserva"]
+        chart.columns = ["Capital total", "Invertido", "Líquido"]
         st.line_chart(chart, height=300, color=["#D9A84E", "#4F78C0", "#3A4763"])
 
         colw, colm = st.columns(2)
@@ -149,11 +149,11 @@ with tab_res:
 
 # ============================ POSICIONES ============================
 with tab_pos:
-    st.markdown("#### Reserva (capital sin invertir)")
+    st.markdown("#### Líquido (capital sin invertir)")
     rc1, rc2 = st.columns([2, 3])
     new_cash = rc1.number_input("Efectivo / stablecoins (USDT)", value=float(cash),
                                 min_value=0.0, step=100.0, label_visibility="collapsed")
-    if rc2.button("Guardar reserva"):
+    if rc2.button("Guardar líquido"):
         db.set_cash(new_cash)
         st.rerun()
 
@@ -294,9 +294,9 @@ with tab_hist:
         hdf = hdf.sort_values("ts", ascending=False)
         st.dataframe(
             hdf.rename(columns={"ts": "Fecha (UTC)", "capital": "Capital",
-                                "deployed": "Desplegado", "reserve": "Reserva", "pnl": "P&L"})
-            .style.format({"Capital": "${:,.2f}", "Desplegado": "${:,.2f}",
-                           "Reserva": "${:,.2f}", "P&L": "{:+,.2f}",
+                                "deployed": "Invertido", "reserve": "Líquido", "pnl": "P&L"})
+            .style.format({"Capital": "${:,.2f}", "Invertido": "${:,.2f}",
+                           "Líquido": "${:,.2f}", "P&L": "{:+,.2f}",
                            "Fecha (UTC)": lambda t: t.strftime("%Y-%m-%d %H:%M")}),
             use_container_width=True, hide_index=True)
     else:
