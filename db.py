@@ -1,12 +1,13 @@
 """
 Capa de datos del fondo. Fuente de verdad compartida.
 
-Por defecto usa SQLite (un archivo local). Para uso compartido, apuntá a un
-Postgres/Supabase con la variable de entorno DATABASE_URL.
-
-Soporta dos tipos de posición:
+Tipos de posición:
   - spot     : contado. Aporta al fondo su valor de mercado.
   - futures  : perpetuo con margen aislado. Aporta al fondo margen + PnL.
+
+Operaciones cerradas: al cerrar una posición se registra su PnL realizado y se
+devuelve el dinero recuperado al Líquido (reserva). El PnL total del fondo es
+realizado (acumulado) + no realizado (posiciones abiertas).
 """
 import os
 import json
@@ -37,6 +38,21 @@ positions = Table(
     Column("created_at", DateTime, default=dt.datetime.utcnow),
 )
 
+closed_trades = Table(
+    "closed_trades", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("symbol", String(32)),
+    Column("exchange", String(32)),
+    Column("side", String(8)),
+    Column("market_type", String(16), default="spot"),
+    Column("qty", Float),
+    Column("entry", Float),
+    Column("exit_price", Float),
+    Column("realized_pnl", Float),
+    Column("opened_date", String(16)),
+    Column("closed_at", DateTime, default=dt.datetime.utcnow),
+)
+
 meta = Table(
     "meta", metadata,
     Column("key", String(64), primary_key=True),
@@ -50,15 +66,22 @@ snapshots = Table(
     Column("capital", Float),
     Column("deployed", Float),
     Column("reserve", Float),
-    Column("pnl", Float),
+    Column("pnl", Float),            # no realizado (posiciones abiertas)
+    Column("realized", Float, default=0.0),  # realizado acumulado al momento
     Column("detail", Text),
 )
 
+# Columnas que pueden faltar en bases creadas con versiones anteriores.
 _NEW_COLUMNS = {
-    "market_type": "VARCHAR(16) DEFAULT 'spot'",
-    "leverage": "FLOAT DEFAULT 1",
-    "added_margin": "FLOAT DEFAULT 0",
-    "liq_price": "FLOAT",
+    "positions": {
+        "market_type": "VARCHAR(16) DEFAULT 'spot'",
+        "leverage": "FLOAT DEFAULT 1",
+        "added_margin": "FLOAT DEFAULT 0",
+        "liq_price": "FLOAT",
+    },
+    "snapshots": {
+        "realized": "FLOAT DEFAULT 0",
+    },
 }
 
 
@@ -68,15 +91,16 @@ def init_db():
 
 
 def _migrate():
-    """Agrega columnas nuevas sin borrar datos existentes (spot ya cargado)."""
     insp = inspect(engine)
-    existing = {c["name"] for c in insp.get_columns("positions")}
     with engine.begin() as c:
-        for col, ddl in _NEW_COLUMNS.items():
-            if col not in existing:
-                c.execute(text(f"ALTER TABLE positions ADD COLUMN {col} {ddl}"))
+        for table, cols in _NEW_COLUMNS.items():
+            existing = {col["name"] for col in insp.get_columns(table)}
+            for col, ddl in cols.items():
+                if col not in existing:
+                    c.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
 
 
+# ---------- posiciones abiertas ----------
 def get_positions():
     with engine.begin() as c:
         rows = c.execute(select(positions).order_by(positions.c.created_at)).fetchall()
@@ -113,6 +137,54 @@ def delete_position(pid):
         c.execute(delete(positions).where(positions.c.id == pid))
 
 
+# ---------- cerrar posición (registra realizado) ----------
+def realized_pnl_of(p, exit_price):
+    if p["side"] == "Short":
+        return p["qty"] * (p["entry"] - exit_price)
+    return p["qty"] * (exit_price - p["entry"])
+
+
+def proceeds_of(p, exit_price, realized):
+    """Dinero que vuelve al Líquido al cerrar."""
+    if (p.get("market_type") or "spot") == "futures":
+        lev = p.get("leverage") or 1.0
+        total_margin = (p["qty"] * p["entry"]) / lev + (p.get("added_margin") or 0.0)
+        return total_margin + realized
+    return p["qty"] * exit_price
+
+
+def close_position(pid, exit_price):
+    with engine.begin() as c:
+        row = c.execute(select(positions).where(positions.c.id == pid)).fetchone()
+    if not row:
+        return None
+    p = dict(row._mapping)
+    realized = realized_pnl_of(p, exit_price)
+    proceeds = proceeds_of(p, exit_price, realized)
+    with engine.begin() as c:
+        c.execute(insert(closed_trades).values(
+            symbol=p["symbol"], exchange=p["exchange"], side=p["side"],
+            market_type=p.get("market_type", "spot"), qty=p["qty"], entry=p["entry"],
+            exit_price=exit_price, realized_pnl=realized,
+            opened_date=p.get("buy_date"), closed_at=dt.datetime.utcnow()))
+    set_cash(get_cash() + proceeds)
+    delete_position(pid)
+    return {"realized": realized, "proceeds": proceeds}
+
+
+def get_closed_trades():
+    with engine.begin() as c:
+        rows = c.execute(select(closed_trades).order_by(closed_trades.c.closed_at.desc())).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def realized_total():
+    with engine.begin() as c:
+        r = c.execute(select(func.coalesce(func.sum(closed_trades.c.realized_pnl), 0.0))).fetchone()
+    return float(r[0]) if r else 0.0
+
+
+# ---------- meta (reserva, capital inicial) ----------
 def _get_meta(key, default=0.0):
     with engine.begin() as c:
         r = c.execute(select(meta.c.value).where(meta.c.key == key)).fetchone()
@@ -144,12 +216,13 @@ def set_initial_capital(amount):
     _set_meta("initial_capital", amount)
 
 
+# ---------- snapshots ----------
 def add_snapshot(pf, ts=None):
     with engine.begin() as c:
         c.execute(insert(snapshots).values(
             ts=ts or dt.datetime.utcnow(),
             capital=pf["capital"], deployed=pf["deployed"],
-            reserve=pf["reserve"], pnl=pf["pnl"],
+            reserve=pf["reserve"], pnl=pf["pnl"], realized=realized_total(),
             detail=json.dumps(pf.get("rows", []), default=str),
         ))
 
