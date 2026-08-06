@@ -179,13 +179,13 @@ with tab_pos:
                 "Activo": r["symbol"],
                 "Tipo": "Futuros" if fut else "Spot",
                 "Lado": r["side"],
-                "Cantidad": r["qty"],
+                "Unidades": r["qty"],
                 "Entrada": r["entry"],
                 "Precio": r["mark"] if priced else None,
                 "Apal": r.get("leverage") if fut else None,
-                "Notional": r["notional"],
+                "Invertido": r["notional"],
                 "Margen": r.get("total_margin") if fut else None,
-                "Valor": r["value"],
+                "Valor actual": r["value"],
                 "P&L": r["pnl"] if priced else None,
                 "P&L% marg": r["pnl_pct"] if priced else None,
                 "P&L% noc": r["pnl_pct_notional"] if priced else None,
@@ -200,9 +200,9 @@ with tab_pos:
             return f'color:{"#4FC08D" if v >= 0 else "#E86A72"}'
 
         sty = tdf.style.format({
-            "Cantidad": "{:,.6g}", "Entrada": "${:,.4g}", "Precio": "${:,.4g}",
-            "Apal": "{:.0f}x", "Notional": "${:,.0f}", "Margen": "${:,.2f}",
-            "Valor": "${:,.2f}", "P&L": "{:+,.2f}", "P&L% marg": "{:+.2f}%",
+            "Unidades": "{:,.6g}", "Entrada": "${:,.4g}", "Precio": "${:,.4g}",
+            "Apal": "{:.0f}x", "Invertido": "${:,.0f}", "Margen": "${:,.2f}",
+            "Valor actual": "${:,.2f}", "P&L": "{:+,.2f}", "P&L% marg": "{:+.2f}%",
             "P&L% noc": "{:+.2f}%", "Liq": "${:,.4g}",
         }, na_rep="—").map(color_pnl, subset=["P&L", "P&L% marg", "P&L% noc"])
         st.dataframe(sty, use_container_width=True, hide_index=True)
@@ -234,7 +234,7 @@ with tab_pos:
                             index=0 if not cur or cur["side"] == "Long" else 1)
 
         g1, g2, g3 = st.columns(3)
-        qty = g1.number_input("Cantidad", value=float(cur["qty"]) if cur else 0.0,
+        qty = g1.number_input("Unidades", value=float(cur["qty"]) if cur else 0.0,
                               min_value=0.0, format="%.8f")
         entry = g2.number_input("Precio entrada (USDT)", value=float(cur["entry"]) if cur else 0.0,
                                 min_value=0.0, format="%.6f")
